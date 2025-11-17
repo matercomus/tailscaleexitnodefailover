@@ -5,9 +5,11 @@
 #internet test IP
 inettestip=8.8.8.8
 #prioritized list of exit node tailscale hostnames or IPs (seperated by spaces)
-exitnodes=("nl-ams-wg-008.mullvad.ts.net" "hk-hkg-wg-201.mullvad.ts.net" "jp-tyo-wg-001.mullvad.ts.net" "prox-tailscale.tail496815.ts.net")
-#fallback location filters to search for exit nodes when primary nodes are unavailable (space-separated, e.g. "Poland" "Hong Kong")
-fallback_locations=("Poland" "Hong Kong")
+# Priority order: Hong Kong → Japan → prox-tailscale → Netherlands
+exitnodes=("hk-hkg-wg-201.mullvad.ts.net" "jp-tyo-wg-001.mullvad.ts.net" "prox-tailscale.tail496815.ts.net" "nl-ams-wg-008.mullvad.ts.net")
+#fallback location filters to search for exit nodes when primary nodes are unavailable (space-separated)
+# Priority order: Netherlands → Poland
+fallback_locations=("Netherlands" "Poland")
 #set to false to never remove exit node even if all are down
 failopen=true
 #other tailscale flags, ie. "--advertise-routes=192.169.1.0/24"
@@ -27,6 +29,16 @@ function is_true() {
 
 function get_tailscale_status() {
 	tailscale status 2>/dev/null
+}
+
+function is_node_in_priority_list() {
+	local node=$1
+	for priority_node in "${exitnodes[@]}"; do
+		if [ "$node" == "$priority_node" ]; then
+			return 0
+		fi
+	done
+	return 1
 }
 
 #<====== Notification Functions ======>
@@ -274,16 +286,22 @@ function main() {
 	if is_true "$icmp" && ! is_false "$curexitnode"; then
 		# Internet working with exit node
 		echo "Internet is up using $curexitnode as an exit node."
-		find_best_exit_node
 		
-		if [ "$bestexitnode" == "$curexitnode" ]; then
-			echo "The current exit node is the best exit node."
-		elif ! is_false "$bestexitnode"; then
-			echo "The current exit node is not the best exit node. Switch to best exit node $bestexitnode."
-			set_exit_node "$bestexitnode"
+		# Only check for better nodes if current node is not in priority list (it's a fallback)
+		# This prevents constant switching between working primary nodes
+		if is_node_in_priority_list "$curexitnode"; then
+			echo "Current exit node $curexitnode is in priority list and working. Keeping it."
 		else
-			echo "All exit nodes are down."
-			notify_error "All primary exit nodes are down"
+			# Current node is a fallback, try to find a primary node
+			echo "Current exit node $curexitnode is a fallback node. Checking for primary nodes..."
+			find_best_exit_node
+			
+			if ! is_false "$bestexitnode" && [ "$bestexitnode" != "$curexitnode" ]; then
+				echo "Found primary exit node $bestexitnode. Switching from fallback."
+				set_exit_node "$bestexitnode"
+			else
+				echo "No better primary nodes found. Keeping current fallback node."
+			fi
 		fi
 		
 	elif is_true "$icmp" && is_false "$curexitnode"; then
@@ -301,10 +319,13 @@ function main() {
 			echo "Internet is down and there is not an exit node. Local Internet issue."
 			notify_error "Local Internet connection is down (no exit node configured)"
 		elif is_false "$icmp" && ! is_false "$curexitnode"; then
+			# Internet is down with current exit node - must switch
 			echo "Internet is down using exit node $curexitnode. Looking for other exit nodes..."
 			notify_error "Internet down via exit node $curexitnode, searching for alternatives..."
 			find_best_exit_node
-			set_exit_node "$bestexitnode"
+			if ! is_false "$bestexitnode"; then
+				set_exit_node "$bestexitnode"
+			fi
 		elif is_true "$icmp" && is_false "$curexitnode"; then
 			echo "Internet is working without an exit node."
 		fi
